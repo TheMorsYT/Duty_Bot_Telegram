@@ -26,8 +26,8 @@ from aiogram.types import (
     Message,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8869654174:AAGVnpNBu8t3wKhA1S-czhdGnqxjc7N0jKA")
-OWNER_ID = int(os.getenv("OWNER_ID", "8388492038"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+OWNER_ID = int(os.getenv("OWNER_ID", "PUT_YOUR_TELEGRAM_ID"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "duty_bot.db"))
 
@@ -475,6 +475,7 @@ class Database:
 
 db = Database(DB_PATH)
 router = Router()
+sent_requests_tracking: dict[int, list[tuple[int, int]]] = {}
 
 
 def is_admin_or_owner(role: str) -> bool:
@@ -597,6 +598,24 @@ async def set_commands_for_user(bot: Bot, user: UserRow) -> None:
         commands_for_role(user.role),
         scope=BotCommandScopeChat(chat_id=user.tg_id),
     )
+
+async def send_routed_request(bot: Bot, req_id: int, text: str, kb: InlineKeyboardMarkup, initiator_role: str):
+    target_ids = []
+    
+    if initiator_role == "admin":
+        target_ids = [OWNER_ID]
+    elif initiator_role in {"moderator", "student"}:
+
+        target_ids = await db.get_admin_ids() 
+
+    sent_requests_tracking[req_id] = []
+    
+    for t_id in target_ids:
+        try:
+            msg = await bot.send_message(t_id, text, reply_markup=kb)
+            sent_requests_tracking[req_id].append((t_id, msg.message_id))
+        except Exception as e:
+            logging.warning(f"Не вдалося надіслати запит для ID {t_id}: {e}")
 
 
 async def owner_daily_reminder_loop(bot: Bot) -> None:
@@ -786,8 +805,8 @@ async def cmd_help(message: Message) -> None:
         "/stats - моя статистика чергувань",
         "/help - список команд",
         "/assign [YYYY-MM-DD] - призначити чергових на дату",
+        "/skip_duty [причина] - запит на заміну/пропуск чергування",
     ]
-    student_cmds = ["/skip_duty [причина] - запит на заміну/пропуск чергування"]
     mod_cmds = ["Inline-меню: відмітити відсутніх / запит на дистанційку / запит на призначення"]
     admin_cmds = [
         "/set_group - зберегти поточну групу",
@@ -1502,9 +1521,16 @@ async def cb_absent_done(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:request_swap")
 async def cb_menu_request_swap(callback: CallbackQuery, state: FSMContext) -> None:
     user = await db.get_user(callback.from_user.id)
-    if not user or user.role != "student":
-        await callback.answer("Лише для студентів", show_alert=True)
+    if not user:
+        await callback.answer("Тебе немає у списку групи. Звернись до admin/owner.", show_alert=True)
         return
+
+    today = _today_str()
+    current_duty = await db.get_duty_by_date(today)
+    if not current_duty or user.tg_id not in current_duty:
+        await callback.answer("❌ Ти сьогодні не чергуєш, тому не можеш попросити заміну!", show_alert=True)
+        return
+
     await state.set_state(SkipDutyForm.waiting_reason)
     await callback.message.edit_text("Напиши причину для запиту на заміну:", reply_markup=None)
     await callback.answer()
@@ -1544,8 +1570,11 @@ async def cmd_skip_duty(message: Message, command: CommandObject, state: FSMCont
     user = await get_actor_or_deny(message)
     if not user:
         return
-    if user.role != "student":
-        await message.answer("Команда доступна для студентів.")
+
+    today = _today_str()
+    current_duty = await db.get_duty_by_date(today)
+    if not current_duty or user.tg_id not in current_duty:
+        await message.answer("❌ Ти не можеш змінити чергування, оскільки тебе немає серед чергових на сьогодні!")
         return
 
     reason = (command.args or "").strip()
@@ -1554,13 +1583,22 @@ async def cmd_skip_duty(message: Message, command: CommandObject, state: FSMCont
         await message.answer("Вкажи причину одним повідомленням.")
         return
 
+    if user.role == "owner":
+        await db.add_absence(user.tg_id, today, user.tg_id)  
+        await db.clear_duty_for_date(today)                
+        result = await assign_duty_and_notify(bot, user.tg_id, target_day=today) 
+        await message.answer(f"✅ Чергування успішно пропущено овнером.\nПричина: {reason}\n\n{result}")
+        return
+
     req_id = await db.create_request("skip_duty", user.tg_id, payload=reason)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Підтвердити", callback_data=f"req:approve:{req_id}"),
         InlineKeyboardButton(text="❌ Відхилити", callback_data=f"req:reject:{req_id}"),
     ]])
-    await notify_admins(bot, f"Запит /skip_duty від {full_name(user)}\nПричина: {reason}", kb)
-    await message.answer("Запит надіслано адміністраторам.")
+    
+    text = f"⚠️ Запит /skip_duty від {full_name(user)} (Роль: {user.role})\nПричина: {reason}"
+    await send_routed_request(bot, req_id, text, kb, user.role)
+    await message.answer("Запит на заміну надіслано на розгляд керівництву.")
 
 
 @router.message(ChangeDutyReasonForm.waiting_reason)
@@ -1615,14 +1653,26 @@ async def skip_reason_input(message: Message, state: FSMContext, bot: Bot) -> No
     if not reason:
         await message.answer("Причина не може бути порожньою. Напиши текстом.")
         return
+        
+    today = _today_str()
+    if user.role == "owner":
+        await state.clear()
+        await db.add_absence(user.tg_id, today, user.tg_id)
+        await db.clear_duty_for_date(today)
+        result = await assign_duty_and_notify(bot, user.tg_id, target_day=today)
+        await message.answer(f"✅ Чергування успішно пропущено овнером.\nПричина: {reason}\n\n{result}")
+        return
+
     req_id = await db.create_request("skip_duty", user.tg_id, payload=reason)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Підтвердити", callback_data=f"req:approve:{req_id}"),
         InlineKeyboardButton(text="❌ Відхилити", callback_data=f"req:reject:{req_id}"),
     ]])
-    await notify_admins(bot, f"Запит /skip_duty від {full_name(user)}\nПричина: {reason}", kb)
+    
+    text = f"⚠️ Запит /skip_duty від {full_name(user)} (Роль: {user.role})\nПричина: {reason}"
+    await send_routed_request(bot, req_id, text, kb, user.role)
     await state.clear()
-    await message.answer("Запит надіслано адміністраторам.")
+    await message.answer("Запит на заміну надіслано на розгляд керівництву.")
 
 
 @router.callback_query(F.data.startswith("req:"))
@@ -1633,42 +1683,72 @@ async def cb_request_decision(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     _, action, req_id_str = callback.data.split(":")
-    req = await db.get_request(int(req_id_str))
+    req_id = int(req_id_str)
+    req = await db.get_request(req_id)
+    
+    # Перевірка: чи не закрив цей запит хтось інший секунду тому
     if not req or req["status"] != "pending":
-        await callback.answer("Запит уже оброблено", show_alert=True)
+        await callback.answer("Цей запит уже оброблено іншим адміністратором!", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
+
+    status_text = "СХВАЛЕНО ✅" if action == "approve" else "ВІДХИЛЕНО ❌"
+    actor_name = full_name(user)
+    result_msg = ""
 
     if action == "reject":
         await db.close_request(req["id"], "rejected")
-        await callback.message.answer(f"Запит #{req['id']} відхилено.")
-        await callback.answer("Відхилено")
-        return
+        result_msg = "Запит було відхилено."
+    else:
+        # approve логіка
+        if req["request_type"] == "assign_duty":
+            result_msg = await assign_duty_and_notify(bot, callback.from_user.id)
+        elif req["request_type"] == "toggle_remote":
+            await db.set_status(req["payload"] or "normal")
+            result_msg = f"Статус дня змінено на: {req['payload']}"
+        elif req["request_type"] == "mark_absent":
+            day = req["payload"] or date.today().isoformat()
+            if req["target_user_id"] is None:
+                result_msg = "Помилка: target_user_id відсутній."
+            else:
+                await db.add_absence(req["target_user_id"], day, callback.from_user.id)
+                result_msg = f"Користувача {req['target_user_id']} позначено як відсутнього на {day}."
+        elif req["request_type"] == "skip_duty":
+            # Автоматичний пропуск чергового та перевибір
+            today = date.today().isoformat()
+            await db.add_absence(req["initiator_id"], today, callback.from_user.id) # Ставимо пропуск
+            await db.clear_duty_for_date(today)                                    # Очищуємо старий лог на сьогодні
+            assign_res = await assign_duty_and_notify(bot, callback.from_user.id, target_day=today) # Обираємо нових
+            result_msg = f"Студента пропущено.\n🔄 Результат перевибору чергових: {assign_res}"
 
-    if req["request_type"] == "assign_duty":
-        result = await assign_duty_and_notify(bot, callback.from_user.id)
-        await callback.message.answer(result)
+        await db.close_request(req["id"], "approved")
 
-    elif req["request_type"] == "toggle_remote":
-        await db.set_status(req["payload"] or "normal")
-        await callback.message.answer(f"Запит #{req['id']} виконано: status={req['payload']}")
+    final_text = (
+        f"🏁 **Запит #{req_id} оброблено!**\n"
+        f"Дія: {status_text}\n"
+        f"Хто обробив: {actor_name}\n"
+        f"Деталі: {result_msg}"
+    )
 
-    elif req["request_type"] == "mark_absent":
-        day = req["payload"] or date.today().isoformat()
-        if req["target_user_id"] is None:
-            await callback.message.answer("Помилка: target_user_id відсутній.")
-        else:
-            await db.add_absence(req["target_user_id"], day, callback.from_user.id)
-            await callback.message.answer(f"Запит #{req['id']} виконано: {req['target_user_id']} відсутній ({day}).")
+    copied_messages = sent_requests_tracking.get(req_id, [])
+    for chat_id, msg_id in copied_messages:
+        try:
+            await bot.edit_message_text(
+                text=final_text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=None
+            )
+        except Exception as e:
+            logging.warning(f"Не вдалося оновити копію повідомлення в chat_id {chat_id}: {e}")
 
-    elif req["request_type"] == "skip_duty":
-        await callback.message.answer(
-            f"Запит #{req['id']} (skip duty) схвалено.\n"
-            f"Студент: <code>{req['initiator_id']}</code>\n"
-            f"Причина: {req['payload']}"
-        )
+    if req_id in sent_requests_tracking:
+        del sent_requests_tracking[req_id]
 
-    await db.close_request(req["id"], "approved")
-    await callback.answer("Підтверджено")
+    await callback.answer("Запит успішно оброблено")
 
 
 async def main() -> None:
@@ -1677,7 +1757,6 @@ async def main() -> None:
 
     await db.init()
 
-    # Ensure owner exists with role owner.
     owner_row = await db.get_user(OWNER_ID)
     if not owner_row:
         await db.upsert_user(OWNER_ID, None, "Owner", "Owner", role="owner", has_pm=False)
