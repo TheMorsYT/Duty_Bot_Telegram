@@ -1,0 +1,2 @@
+﻿aiogram>=3.7.0
+aiosqlite>=0.20.0
