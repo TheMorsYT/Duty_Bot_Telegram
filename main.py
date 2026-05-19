@@ -42,6 +42,15 @@ class ChangeDutyReasonForm(StatesGroup):
     waiting_reason = State()
 
 
+class ReplaceDutyForm(StatesGroup):
+    waiting_data = State()
+
+
+class AdminInputForm(StatesGroup):
+    waiting_assign_date = State()
+    waiting_absent_date = State()
+
+
 @dataclass
 class UserRow:
     tg_id: int
@@ -313,15 +322,35 @@ class Database:
             rows = await cursor.fetchall()
         return {r[0] for r in rows}
 
+    async def get_absent_rows(self, day: str) -> list[tuple[int, int]]:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute("SELECT user_id, marked_by FROM absences WHERE date=? ORDER BY user_id", (day,))
+            rows = await cursor.fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     async def get_students(self) -> list[UserRow]:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
                 """
                 SELECT tg_id, username, last_name, first_name, role, duty_count, has_pm, sort_order, in_queue
                 FROM users
-                WHERE in_queue=1
-                ORDER BY sort_order IS NULL, sort_order, rowid
+                WHERE in_queue=1 AND sort_order IS NOT NULL
+                ORDER BY sort_order, rowid
                 """
+            )
+            rows = await cursor.fetchall()
+        return [UserRow(*r) for r in rows]
+
+    async def find_queue_users_by_last_name(self, last_name: str) -> list[UserRow]:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                SELECT tg_id, username, last_name, first_name, role, duty_count, has_pm, sort_order, in_queue
+                FROM users
+                WHERE in_queue=1 AND lower(last_name)=lower(?)
+                ORDER BY sort_order, tg_id
+                """,
+                (last_name,),
             )
             rows = await cursor.fetchall()
         return [UserRow(*r) for r in rows]
@@ -350,6 +379,24 @@ class Database:
         if not row:
             return None
         return row[0], row[1]
+
+    async def replace_duty_member(self, day: str, old_user_id: int, new_user_id: int) -> bool:
+        duty = await self.get_duty_by_date(day)
+        if not duty:
+            return False
+        u1, u2 = duty
+        if old_user_id not in {u1, u2} or new_user_id in {u1, u2}:
+            return False
+        new_u1, new_u2 = (new_user_id, u2) if u1 == old_user_id else (u1, new_user_id)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE duty_log SET user1_id=?, user2_id=? WHERE date=?", (new_u1, new_u2, day))
+            await db.execute(
+                "UPDATE users SET duty_count=CASE WHEN duty_count>0 THEN duty_count-1 ELSE 0 END WHERE tg_id=?",
+                (old_user_id,),
+            )
+            await db.execute("UPDATE users SET duty_count=duty_count+1 WHERE tg_id=?", (new_user_id,))
+            await db.commit()
+        return True
 
     async def clear_duty_for_date(self, day: str) -> int:
         async with aiosqlite.connect(self.path) as db:
@@ -410,7 +457,7 @@ class Database:
                 SELECT last_name, first_name, duty_count
                 FROM users
                 WHERE in_queue=1
-                ORDER BY duty_count DESC, last_name ASC, first_name ASC
+                ORDER BY sort_order IS NULL, sort_order, rowid
                 """
             )
             rows = await cursor.fetchall()
@@ -423,6 +470,34 @@ class Database:
             total_dates = (await c_total.fetchone())[0]
             cursor = await db.execute(
                 "SELECT DISTINCT date FROM duty_log ORDER BY date DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
+            )
+            rows = await cursor.fetchall()
+        return [r[0] for r in rows], total_dates
+
+    async def get_activity_dates_page(self, page: int, page_size: int = 10) -> tuple[list[str], int]:
+        offset = page * page_size
+        async with aiosqlite.connect(self.path) as db:
+            c_total = await db.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT date FROM duty_log
+                    UNION
+                    SELECT date FROM absences
+                )
+                """
+            )
+            total_dates = (await c_total.fetchone())[0]
+            cursor = await db.execute(
+                """
+                SELECT date FROM (
+                    SELECT date FROM duty_log
+                    UNION
+                    SELECT date FROM absences
+                )
+                ORDER BY date DESC
+                LIMIT ? OFFSET ?
+                """,
                 (page_size, offset),
             )
             rows = await cursor.fetchall()
@@ -554,13 +629,15 @@ def commands_for_role(role: str) -> list[BotCommand]:
         return common + [BotCommand(command="skip_duty", description="Запит на заміну/пропуск чергування")]
     if role == "moderator":
         return common + [
-            BotCommand(command="assign", description="Призначити чергових на дату"),
+            BotCommand(command="assign", description="Призначити чергових на сьогодні"),
             BotCommand(command="staff_list", description="Список owner/admin/moderator"),
             BotCommand(command="rm_mod", description="Зняти модератора"),
         ]
     if role == "admin":
         return common + [
-            BotCommand(command="assign", description="Призначити чергових на дату"),
+            BotCommand(command="assign", description="Призначити чергових на сьогодні"),
+            BotCommand(command="replace_duty", description="Ручна заміна чергового"),
+            BotCommand(command="absent_on", description="Відсутні на дату"),
             BotCommand(command="set_group_id", description="Вручну задати group_chat_id"),
             BotCommand(command="unset_group", description="Відв'язати групу"),
             BotCommand(command="group_info", description="Поточна група і статус"),
@@ -575,7 +652,9 @@ def commands_for_role(role: str) -> list[BotCommand]:
         ]
     if role == "owner":
         return common + [
-            BotCommand(command="assign", description="Призначити чергових на дату"),
+            BotCommand(command="assign", description="Призначити чергових на сьогодні"),
+            BotCommand(command="replace_duty", description="Ручна заміна чергового"),
+            BotCommand(command="absent_on", description="Відсутні на дату"),
             BotCommand(command="set_group_id", description="Вручну задати group_chat_id"),
             BotCommand(command="unset_group", description="Відв'язати групу"),
             BotCommand(command="group_info", description="Поточна група і статус"),
@@ -620,9 +699,15 @@ async def send_routed_request(bot: Bot, req_id: int, text: str, kb: InlineKeyboa
 
 async def owner_daily_reminder_loop(bot: Bot) -> None:
     last_sent_day: Optional[str] = None
+    last_reset_day: Optional[str] = None
     while True:
         now = datetime.now()
         today = _today_str()
+        if last_reset_day != today:
+            _group_id, status = await db.get_settings()
+            if status != "normal":
+                await db.set_status("normal")
+            last_reset_day = today
         if now.hour == 10 and now.minute == 30 and last_sent_day != today:
             existing = await db.get_duty_by_date(today)
             if not existing:
@@ -678,6 +763,13 @@ def is_assignment_time_allowed_for_today(target_day: str) -> bool:
     )
 
 
+def is_today_window_open() -> bool:
+    return is_assignment_time_allowed_for_today(_today_str())
+
+
+TIME_WINDOW_TEXT = "Операції з чергуванням доступні лише з 09:00 до 14:00."
+
+
 async def assign_duty_and_notify(bot: Bot, triggered_by: int, target_day: Optional[str] = None) -> str:
     duty_day = target_day or _today_str()
     group_chat_id, status = await db.get_settings()
@@ -694,14 +786,26 @@ async def assign_duty_and_notify(bot: Bot, triggered_by: int, target_day: Option
         return "Недостатньо студентів у БД для призначення 2 чергових."
 
     absent = await db.get_absent_ids(duty_day)
-    current_index = await db.get_queue_index()
-    n = len(students)
+    order_students = sorted([s for s in students if s.sort_order is not None], key=lambda s: (s.sort_order, s.tg_id))
+    if len(order_students) < 2:
+        return "Недостатньо студентів з вказаними номерами (sort_order) для призначення."
+
+    order_values = [s.sort_order for s in order_students]
+    start_order = await db.get_queue_index()
+    if start_order not in order_values:
+        start_order = order_values[0]
+    start_idx = 0
+    for i, val in enumerate(order_values):
+        if val >= start_order:
+            start_idx = i
+            break
 
     picked: list[UserRow] = []
     checked = 0
-    idx = current_index
+    idx = start_idx
+    n = len(order_students)
     while len(picked) < 2 and checked < n:
-        candidate = students[idx]
+        candidate = order_students[idx]
         if candidate.tg_id not in absent and all(p.tg_id != candidate.tg_id for p in picked):
             picked.append(candidate)
         idx = (idx + 1) % n
@@ -710,30 +814,31 @@ async def assign_duty_and_notify(bot: Bot, triggered_by: int, target_day: Option
     if len(picked) < 2:
         return "Сьогодні неможливо обрати 2 чергових (занадто багато відсутніх)."
 
-    await db.set_queue_index(idx)
+    next_order = order_students[idx].sort_order
+    await db.set_queue_index(next_order)
     await db.log_duty(duty_day, picked[0].tg_id, picked[1].tg_id)
 
     day_text = "Сьогодні" if duty_day == _today_str() else f"На {duty_day}"
     group_text = f"🔔 {day_text} чергові: {mention_html(picked[0])} та {mention_html(picked[1])}"
     await bot.send_message(group_chat_id, group_text)
 
-    for i, duty_user in enumerate(picked):
-        partner = picked[1 - i]
-        if duty_user.has_pm:
-            try:
-                await bot.send_message(
-                    duty_user.tg_id,
-                    f"Привіт! Ти сьогодні чергуєш. Твій напарник: {mention_html(partner)}",
-                )
-            except TelegramForbiddenError:
-                await db.upsert_user(
-                    duty_user.tg_id,
-                    duty_user.username,
-                    duty_user.last_name,
-                    duty_user.first_name,
-                    role=duty_user.role,
-                    has_pm=False,
-                )
+#    for i, duty_user in enumerate(picked):
+#     partner = picked[1 - i]
+#     if duty_user.has_pm:
+#         try:
+#             await bot.send_message(
+#                 duty_user.tg_id,
+#                 f"Привіт! Ти сьогодні чергуєш. Твій напарник: {mention_html(partner)}",
+#             )
+#         except TelegramForbiddenError:
+#             await db.upsert_user(
+#                 duty_user.tg_id,
+#                 duty_user.username,
+#                 duty_user.last_name,
+#                 duty_user.first_name,
+#                 role=duty_user.role,
+#                 has_pm=False,
+#             )
     return f"Призначення виконано адміністратором {triggered_by}."
 
 
@@ -746,6 +851,27 @@ def menu_keyboard(role: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🧑‍🤝‍🧑 Призначити чергових", callback_data="menu:assign")])
         rows.append([InlineKeyboardButton(text="🙅 Відмітити відсутнього", callback_data="menu:mark_absent")])
         rows.append([InlineKeyboardButton(text="🏠/💻 Перемкнути дистанційку", callback_data="menu:toggle_remote")])
+    if role in {"owner", "admin"}:
+        rows.append([InlineKeyboardButton(text="🔁 Заміна чергового", callback_data="menu:replace_duty")])
+    if role in {"owner", "admin", "moderator"}:
+        rows.append([InlineKeyboardButton(text="👥 Ролі", callback_data="menu:staff_list")])
+        rows.append([InlineKeyboardButton(text="📅 Відсутні сьогодні", callback_data="menu:absent_today")])
+    if role in {"owner", "admin"}:
+        rows.append([InlineKeyboardButton(text="⚙️ Адмін-панель", callback_data="menu:admin_tools")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_tools_keyboard(role: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🧑‍🤝‍🧑 Призначити сьогодні", callback_data="tools:assign_today")],
+        [InlineKeyboardButton(text="🔁 Заміна чергового", callback_data="menu:replace_duty")],
+        [InlineKeyboardButton(text="🙅 Відсутні на дату", callback_data="tools:absent_date")],
+        [InlineKeyboardButton(text="📚 Загальна статистика", callback_data="menu:stats_all")],
+        [InlineKeyboardButton(text="👥 Ролі", callback_data="menu:staff_list")],
+    ]
+    if role in {"owner", "admin"}:
+        rows.append([InlineKeyboardButton(text="ℹ️ Група/статус", callback_data="tools:group_info")])
+    rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="stats_back_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -804,7 +930,8 @@ async def cmd_help(message: Message) -> None:
         "/menu - головне меню",
         "/stats - моя статистика чергувань",
         "/help - список команд",
-        "/assign [YYYY-MM-DD] - призначити чергових на дату",
+        "/assign - призначити чергових на сьогодні",
+        "/replace_duty <Старе_прізвище> <Нове_прізвище> [YYYY-MM-DD] - ручна заміна чергового",
         "/skip_duty [причина] - запит на заміну/пропуск чергування",
     ]
     mod_cmds = ["Inline-меню: відмітити відсутніх / запит на дистанційку / запит на призначення"]
@@ -820,6 +947,7 @@ async def cmd_help(message: Message) -> None:
         "/sync_user &lt;TG_ID&gt; - підтягнути актуальний username з групи",
         "/sync_students - масово оновити username для студентів",
         "/staff_list - список owner/admin/moderator",
+        "/absent_on [YYYY-MM-DD] - список відсутніх на дату",
         "/add_mod &lt;TG_ID&gt; - призначити модератора",
         "/rm_mod &lt;TG_ID&gt; - зняти права модератора",
         "Inline-меню: призначити чергових, відмітити відсутніх, перемкнути дистанційку",
@@ -1207,9 +1335,8 @@ async def cmd_students(message: Message, bot: Bot) -> None:
         await refresh_user_username_from_group(bot, st.tg_id)
     students = await db.get_students()
     lines = ["Список студентів (порядок черги):"]
-    for i, st in enumerate(students, start=1):
-        order = st.sort_order if st.sort_order is not None else i
-        lines.append(f"{order}. {st.last_name} {st.first_name} (ID: {st.tg_id})")
+    for st in students:
+        lines.append(f"{st.sort_order}. {st.last_name} {st.first_name} (ID: {st.tg_id})")
     await message.answer("\n".join(lines))
 
 
@@ -1330,7 +1457,7 @@ async def cb_stats_dates_pages(callback: CallbackQuery) -> None:
         page = int(callback.data.split(":")[-1])
     else:
         page = int(callback.data.split(":")[-1])
-    dates, total = await db.get_duty_dates_page(page, page_size=10)
+    dates, total = await db.get_activity_dates_page(page, page_size=10)
     if not dates:
         text = "Журнал чергувань порожній."
     else:
@@ -1343,14 +1470,24 @@ async def cb_stats_dates_pages(callback: CallbackQuery) -> None:
 async def cb_stats_date_detail(callback: CallbackQuery) -> None:
     day = callback.data.split(":", 1)[1]
     duty = await db.get_duty_by_date(day)
-    if not duty:
-        text = f"За {day} запис не знайдено."
-    else:
+    absent_rows = await db.get_absent_rows(day)
+    lines = [f"📌 {day}"]
+    if duty:
         u1 = await db.get_user(duty[0])
         u2 = await db.get_user(duty[1])
         p1 = full_name(u1) if u1 else str(duty[0])
         p2 = full_name(u2) if u2 else str(duty[1])
-        text = f"📌 {day}\nЧергові: {p1} та {p2}"
+        lines.append(f"Чергові: {p1} та {p2}")
+    else:
+        lines.append("Чергові: немає запису")
+    if absent_rows:
+        lines.append("Відсутні:")
+        for uid, _marked_by in absent_rows:
+            u = await db.get_user(uid)
+            lines.append(f"- {full_name(u) if u else uid}")
+    else:
+        lines.append("Відсутні: немає")
+    text = "\n".join(lines)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 До дат", callback_data="stats_all:dates:0")],
         [InlineKeyboardButton(text="🔙 В меню", callback_data="stats_back_menu")],
@@ -1374,6 +1511,9 @@ async def cb_owner_change_decision(callback: CallbackQuery, bot: Bot) -> None:
     owner = await db.get_user(callback.from_user.id)
     if not owner or owner.role != "owner":
         await callback.answer("Лише owner", show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
         return
     _, action, req_id_str = callback.data.split(":")
     req = await db.get_request(int(req_id_str))
@@ -1399,6 +1539,9 @@ async def cb_menu_assign(callback: CallbackQuery, bot: Bot, state: FSMContext) -
     user_row = await db.get_user(callback.from_user.id)
     if not user_row or not can_manage_day(user_row.role):
         await callback.answer("Немає прав", show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
         return
     duty_day = _today_str()
     if not is_assignment_time_allowed_for_today(duty_day):
@@ -1437,6 +1580,9 @@ async def cb_menu_toggle_remote(callback: CallbackQuery, bot: Bot) -> None:
     if not user_row or not can_manage_day(user_row.role):
         await callback.answer("Немає прав", show_alert=True)
         return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
+        return
 
     _, status = await db.get_settings()
     new_status = "remote" if status != "remote" else "normal"
@@ -1464,6 +1610,12 @@ async def cb_menu_mark_absent(callback: CallbackQuery) -> None:
     if not user_row or not can_manage_day(user_row.role):
         await callback.answer("Немає прав", show_alert=True)
         return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer("Відмічати відсутніх на поточний день можна лише з 09:00 до 14:00.", show_alert=True)
+        return
 
     students = await db.get_students()
     if not students:
@@ -1483,6 +1635,12 @@ async def cb_absent_toggle(callback: CallbackQuery, bot: Bot) -> None:
     user_row = await db.get_user(callback.from_user.id)
     if not user_row or not can_manage_day(user_row.role):
         await callback.answer("Немає прав", show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer("Відмічати відсутніх на поточний день можна лише з 09:00 до 14:00.", show_alert=True)
         return
 
     target_id = int(callback.data.split(":", 1)[1])
@@ -1530,9 +1688,135 @@ async def cb_menu_request_swap(callback: CallbackQuery, state: FSMContext) -> No
     if not current_duty or user.tg_id not in current_duty:
         await callback.answer("❌ Ти сьогодні не чергуєш, тому не можеш попросити заміну!", show_alert=True)
         return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer("Запит на заміну на поточний день можна подати лише з 09:00 до 14:00.", show_alert=True)
+        return
 
     await state.set_state(SkipDutyForm.waiting_reason)
     await callback.message.edit_text("Напиши причину для запиту на заміну:", reply_markup=None)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:staff_list")
+async def cb_menu_staff_list(callback: CallbackQuery) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin", "moderator"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    owners = await db.get_users_by_role("owner")
+    admins = await db.get_users_by_role("admin")
+    moderators = await db.get_users_by_role("moderator")
+
+    def fmt(rows: list[UserRow]) -> list[str]:
+        if not rows:
+            return ["- немає"]
+        return [f"- {full_name(r)} (ID: {r.tg_id})" for r in rows]
+
+    lines = ["👥 Список керівних ролей:", "", "Owner:"] + fmt(owners)
+    lines += ["", "Admins:"] + fmt(admins)
+    lines += ["", "Moderators:"] + fmt(moderators)
+    await callback.message.edit_text("\n".join(lines), reply_markup=menu_keyboard(user.role))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:absent_today")
+async def cb_menu_absent_today(callback: CallbackQuery) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin", "moderator"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    target_day = _today_str()
+    rows = await db.get_absent_rows(target_day)
+    if not rows:
+        text = f"На {target_day} відсутніх не зафіксовано."
+    else:
+        lines = [f"🙅 Відсутні на {target_day}:"]
+        for user_id, marked_by in rows:
+            u = await db.get_user(user_id)
+            m = await db.get_user(marked_by)
+            lines.append(f"- {full_name(u) if u else user_id} (відмітив: {full_name(m) if m else marked_by})")
+        text = "\n".join(lines)
+    await callback.message.edit_text(text, reply_markup=menu_keyboard(user.role))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:admin_tools")
+async def cb_menu_admin_tools(callback: CallbackQuery) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    await callback.message.edit_text("⚙️ Адмін-панель:", reply_markup=admin_tools_keyboard(user.role))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "tools:assign_today")
+async def cb_tools_assign_today(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    if not is_today_window_open():
+        await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
+        return
+    day = _today_str()
+    if not is_assignment_time_allowed_for_today(day):
+        await callback.answer("Призначати чергових на поточний день можна лише з 09:00 до 14:00.", show_alert=True)
+        return
+    existing = await db.get_duty_by_date(day)
+    if existing and user.role == "owner":
+        await db.clear_duty_for_date(day)
+    elif existing:
+        await callback.answer("Вже призначено. Для зміни потрібне погодження owner.", show_alert=True)
+        return
+    result = await assign_duty_and_notify(bot, user.tg_id, target_day=day)
+    await callback.message.edit_text(result, reply_markup=admin_tools_keyboard(user.role))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "tools:absent_date")
+async def cb_tools_absent_date(callback: CallbackQuery, state: FSMContext) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin", "moderator"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    await state.set_state(AdminInputForm.waiting_absent_date)
+    await callback.message.edit_text("Введи дату для перегляду відсутніх: YYYY-MM-DD", reply_markup=None)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "tools:group_info")
+async def cb_tools_group_info(callback: CallbackQuery) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    group_chat_id, status = await db.get_settings()
+    group_text = str(group_chat_id) if group_chat_id is not None else "не встановлено"
+    await callback.message.edit_text(
+        f"Поточна група: <code>{group_text}</code>\nСтатус дня: <b>{status}</b>",
+        reply_markup=admin_tools_keyboard(user.role),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:replace_duty")
+async def cb_menu_replace_duty(callback: CallbackQuery, state: FSMContext) -> None:
+    user = await db.get_user(callback.from_user.id)
+    if not user or user.role not in {"owner", "admin"}:
+        await callback.answer("Немає прав", show_alert=True)
+        return
+    await state.set_state(ReplaceDutyForm.waiting_data)
+    await callback.message.edit_text(
+        "⏰ Дія доступна лише з 09:00 до 14:00.\n"
+        "Введи заміну у форматі:\n"
+        "&lt;Старе_прізвище&gt; &lt;Нове_прізвище&gt; [YYYY-MM-DD]\n"
+        "Приклад: Калініченко Капустян 2026-05-19",
+        reply_markup=None,
+    )
     await callback.answer()
 
 
@@ -1544,14 +1828,15 @@ async def cmd_assign(message: Message, command: CommandObject, bot: Bot, state: 
     if not can_manage_day(user.role):
         await message.answer("Немає прав для /assign")
         return
-    target_day = (command.args or "").strip() or _today_str()
-    try:
-        datetime.strptime(target_day, "%Y-%m-%d")
-    except ValueError:
-        await message.answer("Формат дати: YYYY-MM-DD")
+    if not is_today_window_open():
+        await message.answer(TIME_WINDOW_TEXT)
+        return
+    target_day = _today_str()
+    if (command.args or "").strip():
+        await message.answer("Призначення доступне тільки на сьогодні. Використай /assign без дати.")
         return
     if not is_assignment_time_allowed_for_today(target_day):
-        await message.answer("Призначати чергових на поточний день можна лише з 09:00 до 14:00.")
+        await message.answer(TIME_WINDOW_TEXT)
         return
     existing = await db.get_duty_by_date(target_day)
     if existing and user.role in {"admin", "moderator"}:
@@ -1565,10 +1850,136 @@ async def cmd_assign(message: Message, command: CommandObject, bot: Bot, state: 
     await message.answer(result)
 
 
+@router.message(Command("replace_duty"))
+async def cmd_replace_duty(message: Message, command: CommandObject, bot: Bot) -> None:
+    await process_replace_duty(message, bot, (command.args or "").strip())
+
+
+async def process_replace_duty(message: Message, bot: Bot, raw_args: str) -> None:
+    user = await get_actor_or_deny(message)
+    if not user:
+        return
+    if user.role not in {"owner", "admin"}:
+        await message.answer("Немає прав для /replace_duty")
+        return
+    if not is_today_window_open():
+        await message.answer(TIME_WINDOW_TEXT)
+        return
+    args = raw_args.split()
+    if len(args) < 2:
+        await message.answer("Формат: /replace_duty &lt;Старе_прізвище&gt; &lt;Нове_прізвище&gt; [YYYY-MM-DD]")
+        return
+    old_last = args[0].strip()
+    new_last = args[1].strip()
+    target_day = args[2] if len(args) >= 3 else _today_str()
+    try:
+        datetime.strptime(target_day, "%Y-%m-%d")
+    except ValueError:
+        await message.answer("Формат дати: YYYY-MM-DD")
+        return
+    duty = await db.get_duty_by_date(target_day)
+    if not duty:
+        await message.answer("На цю дату немає призначених чергових.")
+        return
+    duty_users = [await db.get_user(duty[0]), await db.get_user(duty[1])]
+    old_candidates = [u for u in duty_users if u and u.last_name.lower() == old_last.lower()]
+    if len(old_candidates) != 1:
+        await message.answer("Старе прізвище не знайдено серед поточних чергових або воно неоднозначне.")
+        return
+    old_user = old_candidates[0]
+
+    new_candidates = await db.find_queue_users_by_last_name(new_last)
+    if len(new_candidates) != 1:
+        await message.answer("Нове прізвище не знайдено в черзі або воно неоднозначне. Уточни через /students.")
+        return
+    new_user = new_candidates[0]
+    old_id = old_user.tg_id
+    new_id = new_user.tg_id
+    absent = await db.get_absent_ids(target_day)
+    if new_id in absent:
+        await message.answer("Цей користувач позначений як відсутній на цю дату.")
+        return
+    ok = await db.replace_duty_member(target_day, old_id, new_id)
+    if not ok:
+        await message.answer("Не вдалося виконати заміну. Перевір IDs.")
+        return
+    group_chat_id, _ = await db.get_settings()
+    old_name = full_name(old_user) if old_user else str(old_id)
+    new_name = full_name(new_user)
+    if group_chat_id:
+        try:
+            await bot.send_message(group_chat_id, f"🔁 По чергуванню: {old_name} змінено на {new_name}.")
+        except Exception:
+            pass
+    await message.answer(f"✅ Заміна виконана: {old_name} -> {new_name} ({target_day}).")
+
+
+@router.message(ReplaceDutyForm.waiting_data)
+async def replace_duty_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    await state.clear()
+    await process_replace_duty(message, bot, (message.text or "").strip())
+
+
+@router.message(AdminInputForm.waiting_absent_date)
+async def admin_absent_date_input(message: Message, state: FSMContext) -> None:
+    day = (message.text or "").strip()
+    await state.clear()
+    user = await get_actor_or_deny(message)
+    if not user:
+        return
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        await message.answer("Невірний формат дати. Використай YYYY-MM-DD.")
+        return
+    rows = await db.get_absent_rows(day)
+    if not rows:
+        await message.answer(f"На {day} відсутніх не зафіксовано.")
+        return
+    lines = [f"🙅 Відсутні на {day}:"]
+    for user_id, marked_by in rows:
+        u = await db.get_user(user_id)
+        m = await db.get_user(marked_by)
+        lines.append(f"- {full_name(u) if u else user_id} (відмітив: {full_name(m) if m else marked_by})")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("absent_on"))
+async def cmd_absent_on(message: Message, command: CommandObject) -> None:
+    user = await get_actor_or_deny(message)
+    if not user:
+        return
+    if user.role not in {"owner", "admin", "moderator"}:
+        await message.answer("Немає прав для /absent_on")
+        return
+    target_day = (command.args or "").strip() or _today_str()
+    try:
+        datetime.strptime(target_day, "%Y-%m-%d")
+    except ValueError:
+        await message.answer("Формат: /absent_on [YYYY-MM-DD]")
+        return
+    rows = await db.get_absent_rows(target_day)
+    if not rows:
+        await message.answer(f"На {target_day} відсутніх не зафіксовано.")
+        return
+    lines = [f"🙅 Відсутні на {target_day}:"]
+    for user_id, marked_by in rows:
+        u = await db.get_user(user_id)
+        m = await db.get_user(marked_by)
+        lines.append(f"- {full_name(u) if u else user_id} (відмітив: {full_name(m) if m else marked_by})")
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command("skip_duty"))
 async def cmd_skip_duty(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
     user = await get_actor_or_deny(message)
     if not user:
+        return
+    if not is_today_window_open():
+        await message.answer(TIME_WINDOW_TEXT)
+        return
+    if not is_today_window_open():
+        await message.answer("Запит на заміну на поточний день можна подати лише з 09:00 до 14:00.")
         return
 
     today = _today_str()
@@ -1605,6 +2016,10 @@ async def cmd_skip_duty(message: Message, command: CommandObject, state: FSMCont
 async def change_duty_reason_input(message: Message, state: FSMContext, bot: Bot) -> None:
     actor = await get_actor_or_deny(message)
     if not actor:
+        return
+    if not is_today_window_open():
+        await state.clear()
+        await message.answer(TIME_WINDOW_TEXT)
         return
     reason = (message.text or "").strip()
     if not reason:
@@ -1648,6 +2063,14 @@ async def change_duty_reason_input(message: Message, state: FSMContext, bot: Bot
 async def skip_reason_input(message: Message, state: FSMContext, bot: Bot) -> None:
     user = await get_actor_or_deny(message)
     if not user:
+        return
+    if not is_today_window_open():
+        await state.clear()
+        await message.answer(TIME_WINDOW_TEXT)
+        return
+    if not is_today_window_open():
+        await state.clear()
+        await message.answer("Запит на заміну на поточний день можна подати лише з 09:00 до 14:00.")
         return
     reason = (message.text or "").strip()
     if not reason:
@@ -1702,7 +2125,15 @@ async def cb_request_decision(callback: CallbackQuery, bot: Bot) -> None:
     if action == "reject":
         await db.close_request(req["id"], "rejected")
         result_msg = "Запит було відхилено."
+        if req["request_type"] == "skip_duty":
+            try:
+                await bot.send_message(req["initiator_id"], "❌ Твій запит на заміну/пропуск чергування відхилено.")
+            except TelegramForbiddenError:
+                pass
     else:
+        if req["request_type"] in {"assign_duty", "toggle_remote", "mark_absent", "skip_duty"} and not is_today_window_open():
+            await callback.answer(TIME_WINDOW_TEXT, show_alert=True)
+            return
         # approve логіка
         if req["request_type"] == "assign_duty":
             result_msg = await assign_duty_and_notify(bot, callback.from_user.id)
@@ -1717,12 +2148,34 @@ async def cb_request_decision(callback: CallbackQuery, bot: Bot) -> None:
                 await db.add_absence(req["target_user_id"], day, callback.from_user.id)
                 result_msg = f"Користувача {req['target_user_id']} позначено як відсутнього на {day}."
         elif req["request_type"] == "skip_duty":
-            # Автоматичний пропуск чергового та перевибір
             today = date.today().isoformat()
-            await db.add_absence(req["initiator_id"], today, callback.from_user.id) # Ставимо пропуск
-            await db.clear_duty_for_date(today)                                    # Очищуємо старий лог на сьогодні
-            assign_res = await assign_duty_and_notify(bot, callback.from_user.id, target_day=today) # Обираємо нових
+            before = await db.get_duty_by_date(today)
+            await db.add_absence(req["initiator_id"], today, callback.from_user.id)
+            await db.clear_duty_for_date(today)
+            assign_res = await assign_duty_and_notify(bot, callback.from_user.id, target_day=today)
+            after = await db.get_duty_by_date(today)
             result_msg = f"Студента пропущено.\n🔄 Результат перевибору чергових: {assign_res}"
+
+            try:
+                await bot.send_message(req["initiator_id"], "✅ Твій запит на заміну/пропуск чергування схвалено.")
+            except TelegramForbiddenError:
+                pass
+
+            group_chat_id, _ = await db.get_settings()
+            if group_chat_id and before and after:
+                before_set = set(before)
+                after_set = set(after)
+                removed = list(before_set - after_set)
+                added = list(after_set - before_set)
+                if removed and added:
+                    old_u = await db.get_user(removed[0])
+                    new_u = await db.get_user(added[0])
+                    old_name = full_name(old_u) if old_u else str(removed[0])
+                    new_name = full_name(new_u) if new_u else str(added[0])
+                    try:
+                        await bot.send_message(group_chat_id, f"🔁 По чергуванню: {old_name} змінено на {new_name}.")
+                    except Exception:
+                        pass
 
         await db.close_request(req["id"], "approved")
 
@@ -1780,7 +2233,7 @@ async def main() -> None:
             BotCommand(command="students", description="Список черги"),
             BotCommand(command="staff_list", description="Список owner/admin/moderator"),
             BotCommand(command="skip_duty", description="Запит на пропуск чергування"),
-            BotCommand(command="assign", description="Призначити чергових на дату"),
+            BotCommand(command="assign", description="Призначити чергових на сьогодні"),
             BotCommand(command="cancel", description="Скасувати поточну дію"),
         ],
         scope=BotCommandScopeAllPrivateChats(),
